@@ -1,0 +1,65 @@
+---
+title: "Hello World: Building This Blog with Astro"
+description: "A first post exploring how this blog was built with Astro, Tailwind CSS, and MDX — complete with syntax highlighting examples."
+pubDate: 2025-02-20
+tags: ["astro", "webdev", "typescript"]
+---
+
+Welcome to my blog! This is a quick tour of the stack powering this site and a chance to show off the syntax highlighting.
+
+## The Stack
+
+This blog is built with [Astro](https://astro.build) — a fast, content-focused static site generator. Styling is handled by Tailwind CSS v4, and posts are written in MDX so I can embed components directly in my articles.
+
+## Code Examples
+
+Here's a TypeScript utility for formatting dates:
+
+```typescript
+function formatDate(date: Date): string {
+  return date.toLocaleDateString("en-US", {
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+  });
+}
+
+const today = formatDate(new Date());
+console.log(`Today is ${today}`);
+```
+
+A simple Express server in JavaScript:
+
+```javascript
+import express from "express";
+
+const app = express();
+
+app.get("/api/health", (req, res) => {
+  res.json({ status: "ok", timestamp: Date.now() });
+});
+
+app.listen(3000, () => {
+  console.log("Server running on port 3000");
+});
+```
+
+And a multi-stage Dockerfile:
+
+```dockerfile
+FROM node:22-alpine AS builder
+WORKDIR /app
+COPY package.json bun.lock ./
+RUN npm install
+COPY . .
+RUN npm run build
+
+FROM nginx:alpine
+COPY --from=builder /app/dist /usr/share/nginx/html
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]
+```
+
+## What's Next
+
+I'll be writing about DevOps workflows, programming patterns, and whatever else catches my attention. Stay tuned!
