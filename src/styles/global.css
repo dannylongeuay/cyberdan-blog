@@ -4,24 +4,24 @@
 @custom-variant dark (&:where(.dark, .dark *));
 
 @theme {
-  --color-bg: #ffffff;
-  --color-bg-secondary: #f9fafb;
-  --color-text: #1f2937;
-  --color-text-secondary: #6b7280;
-  --color-border: #e5e7eb;
-  --color-accent: #3b82f6;
-  --color-accent-hover: #2563eb;
+  --color-bg: #eff1f5;
+  --color-bg-secondary: #e6e9ef;
+  --color-text: #4c4f69;
+  --color-text-secondary: #6c6f85;
+  --color-border: #ccd0da;
+  --color-accent: #1e66f5;
+  --color-accent-hover: #209fb5;
 }
 
 /* Dark mode theme overrides */
 .dark {
-  --color-bg: #0f172a;
-  --color-bg-secondary: #1e293b;
-  --color-text: #e2e8f0;
-  --color-text-secondary: #94a3b8;
-  --color-border: #334155;
-  --color-accent: #60a5fa;
-  --color-accent-hover: #93c5fd;
+  --color-bg: #1e1e2e;
+  --color-bg-secondary: #181825;
+  --color-text: #cdd6f4;
+  --color-text-secondary: #a6adc8;
+  --color-border: #313244;
+  --color-accent: #89b4fa;
+  --color-accent-hover: #b4befe;
 }
 
 body {
@@ -40,6 +40,7 @@ body {
 /* Code block styling */
 .astro-code {
   padding: 1rem;
+  border: 3px solid var(--color-border);
   border-radius: 0.5rem;
   overflow-x: auto;
   font-size: 0.875rem;
@@ -47,7 +48,7 @@ body {
 }
 
 /* Inline code styling */
-:not(pre) > code {
+:not(pre)>code {
   background-color: var(--color-bg-secondary);
   border: 1px solid var(--color-border);
   border-radius: 0.25rem;
@@ -55,20 +56,38 @@ body {
   font-size: 0.875em;
 }
 
-/* Prose dark mode overrides */
+/* Prose light mode overrides (Catppuccin Latte) */
+.prose {
+  --tw-prose-body: #5c5f77;
+  --tw-prose-headings: #4c4f69;
+  --tw-prose-links: #1e66f5;
+  --tw-prose-bold: #4c4f69;
+  --tw-prose-counters: #6c6f85;
+  --tw-prose-bullets: #6c6f85;
+  --tw-prose-hr: #ccd0da;
+  --tw-prose-quotes: #5c5f77;
+  --tw-prose-quote-borders: #ccd0da;
+  --tw-prose-code: #4c4f69;
+  --tw-prose-pre-code: #4c4f69;
+  --tw-prose-pre-bg: #e6e9ef;
+  --tw-prose-th-borders: #bcc0cc;
+  --tw-prose-td-borders: #ccd0da;
+}
+
+/* Prose dark mode overrides (Catppuccin Mocha) */
 .dark .prose {
-  --tw-prose-body: #cbd5e1;
-  --tw-prose-headings: #e2e8f0;
-  --tw-prose-links: #60a5fa;
-  --tw-prose-bold: #e2e8f0;
-  --tw-prose-counters: #94a3b8;
-  --tw-prose-bullets: #94a3b8;
-  --tw-prose-hr: #334155;
-  --tw-prose-quotes: #cbd5e1;
-  --tw-prose-quote-borders: #334155;
-  --tw-prose-code: #e2e8f0;
-  --tw-prose-pre-code: #e2e8f0;
-  --tw-prose-pre-bg: #1e293b;
-  --tw-prose-th-borders: #475569;
-  --tw-prose-td-borders: #334155;
+  --tw-prose-body: #bac2de;
+  --tw-prose-headings: #cdd6f4;
+  --tw-prose-links: #89b4fa;
+  --tw-prose-bold: #cdd6f4;
+  --tw-prose-counters: #a6adc8;
+  --tw-prose-bullets: #a6adc8;
+  --tw-prose-hr: #313244;
+  --tw-prose-quotes: #bac2de;
+  --tw-prose-quote-borders: #313244;
+  --tw-prose-code: #cdd6f4;
+  --tw-prose-pre-code: #cdd6f4;
+  --tw-prose-pre-bg: #181825;
+  --tw-prose-th-borders: #45475a;
+  --tw-prose-td-borders: #313244;
 }
