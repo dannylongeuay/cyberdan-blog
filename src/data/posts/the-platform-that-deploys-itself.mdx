@@ -1,0 +1,159 @@
+---
+title: "The Platform That Deploys Itself"
+description: "How I run all my side projects on a single Kubernetes cluster that deploys, certifies, and routes itself from a git push — no servers to babysit."
+pubDate: 2026-05-29
+tags: ["kubernetes", "gitops", "argocd", "digitalocean", "devops", "infrastructure"]
+---
+
+I have a pile of side projects. A couple of chess apps, a Connect-4 game, a top-down dodging game,
+a photo gallery from my wedding, and the blog you're reading right now. They're
+unrelated to each other, written in different languages, and all of them need to be online
+somewhere. They all live on one platform I built: [cyberdan-platform](https://github.com/dannylongeuay/cyberdan-platform).
+
+Here's the part that's actually fun to write about: **I almost never log into a server.**
+When I want to ship a change, I `git push`. That's it. The platform notices the new commit,
+deploys the change, hands the app its own HTTPS certificate, and wires up its own DNS record
+so the URL works — all on its own, while I go do something else.
+
+> ### ☸️ See it running
+>
+> Most of these are live right now: **[chess.cyberdan.dev](https://chess.cyberdan.dev/)** and
+> **[c4.cyberdan.dev](https://c4.cyberdan.dev/)** are two board games you can play
+> with challenging computer opponents. This very blog is just another app running on the same cluster —
+> the page you're reading was deployed by the system I'm about to describe.
+
+## What it runs
+
+The platform is a single [Kubernetes](https://kubernetes.io/) cluster hosting a handful of
+small, unrelated apps:
+
+- **The chess stuff** — a browser chess UI plus two separate engines it can play against
+  including bot variants that connect to Lichess.
+- **Connect-4** — the game and a solver that plays it perfectly.
+- **The Infinite Shift** — a top-down dodging game.
+- **A wedding gallery** — photos from my wedding.
+- **This blog.**
+
+None of them have anything to do with each other. But they all need the same boring things:
+a place to run, a web address, and the little padlock that makes the browser trust the
+connection. The interesting question isn't how to do that *once* — it's how to do it for
+every app, every time, without it becoming a part-time job. That's what the platform is for.
+
+## The idea: git is the only control panel
+
+The traditional way to run apps on a server is to log in and *do* things — copy files, run
+commands, restart processes, edit DNS in some web console. The problem is that the server's
+real state slowly drifts away from anything written down. Six months later, nobody quite
+remembers why a setting is the way it is, or whether it's safe to change.
+
+This platform uses an approach called **GitOps**, and the core idea is simple: a git
+repository is the single source of truth for everything that *should* be running. If it's not
+described in the repo, it doesn't exist. If you want to change something, you change the
+repo — never the server directly.
+
+A tool called [**ArgoCD**](https://argo-cd.readthedocs.io/) lives inside the cluster and does
+nothing but compare the two. *Here's what the repo says should be running. Here's what's
+actually running. Are they the same?* If they've drifted apart — because I pushed a new
+commit, or because something crashed — ArgoCD quietly fixes reality to match the repo. It's
+even allowed to heal itself: if something deletes a piece of an app, ArgoCD puts it back.
+
+The payoff is that the repo *is* the system. Want to know why something is configured a
+certain way? It's in the git history, with the commit that did it. Want to roll back? Revert
+the commit. There's no separate, invisible "real" state living on a server that I have to keep
+in my head.
+
+## How the pieces fit together
+
+Underneath, the platform is a few well-known open-source tools stacked together, each one
+quietly taking care of one of those boring-but-necessary jobs. The theme you'll notice is that
+almost everything **manages itself**.
+
+**The cluster runs on someone else's hardware.** The Kubernetes cluster itself is a managed
+one from [DigitalOcean](https://www.digitalocean.com/) — I don't run the machines. I described
+the cluster once, in code, using [OpenTofu](https://opentofu.org/) (an open-source cousin of
+Terraform), so the whole thing can be torn down and recreated from a file rather than clicked
+together by hand. That's the *one* part that isn't automatic from a git push — it's the
+foundation everything else is built on, and it rarely changes.
+
+**It deploys itself.** This is the trick that keeps the whole thing from becoming a chore.
+There's one special ArgoCD app called `root`, and its only job is to watch a folder in the
+repo called `apps/`. Everything inside that folder is *itself* a small app definition. So
+`root` deploys all the other apps, and each of those deploys an actual project. It's apps all
+the way down — a pattern affectionately called **app-of-apps**. Here's the entire `root`
+definition:
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: root
+  namespace: argocd
+spec:
+  source:
+    repoURL: https://github.com/dannylongeuay/cyberdan-platform.git
+    targetRevision: main
+    path: apps          # watch this folder...
+  destination:
+    server: https://kubernetes.default.svc
+  syncPolicy:
+    automated:
+      prune: true       # delete what's no longer in the repo
+      selfHeal: true    # fix anything that drifts
+```
+
+The practical upshot: **adding a whole new project is a tiny amount of work.** I drop the
+app's configuration into a folder, add one short file pointing at it, and push. ArgoCD sees
+the new file and deploys it. No new pipelines, no server access, no checklist.
+
+**It updates itself.** Every app is a container image published to a registry. A companion
+called **ArgoCD Image Updater** watches that registry, and when a new version of an app is
+built and pushed, it updates the running version automatically — no manual step to "promote"
+the new build. (If you scroll my commit history, the steady trickle of "automatic update"
+commits is the platform editing its own repo to record what it just deployed.)
+
+**It gives itself URLs.** When an app declares which web address it wants, a tool called
+[**ExternalDNS**](https://kubernetes-sigs.github.io/external-dns/) reads that and creates the
+matching DNS record automatically. I don't open a DNS console and type in `chess.cyberdan.dev`
+by hand — the app asks for it, and the record appears.
+
+**It secures itself.** The little padlock in the browser comes from a TLS certificate, and
+historically getting those was annoying and easy to forget to renew. Here,
+[**cert-manager**](https://cert-manager.io/) requests free certificates from
+[Let's Encrypt](https://letsencrypt.org/) automatically and renews them before they expire.
+Every app gets HTTPS without me thinking about it.
+
+**It routes traffic.** All the incoming requests for all the different domains land at a single
+front door — a Cilium Gateway built on the modern Kubernetes **Gateway API** — which handles
+the encryption and sends each request to the right app based on its address.
+
+Put those together and the full journey of a change looks like this: I push a commit → ArgoCD
+deploys it → ExternalDNS creates the address → cert-manager issues the certificate → the
+gateway starts routing traffic to it. Five tools, zero logins.
+
+## A few things I'd do again
+
+- **App-of-apps makes new projects nearly free.** The first project is a lot of setup. Every
+  one after that is a folder and a one-line pointer. That low cost is the difference between
+  "I'll host it properly" and "eh, I'll run it on my laptop sometime."
+- **Automating the toil is the whole point — not the fancy parts.** Kubernetes gets the
+  attention, but the reason this is genuinely low-maintenance is the unglamorous automation
+  around it: DNS records, certificate renewals, and image updates that I never have to
+  remember to do. Those are exactly the things that rot when they're manual.
+- **A reproducible dev environment saved me from "works on my machine."** The repo ships a
+  [Nix](https://nixos.org/) flake plus [direnv](https://direnv.net/), so the exact set of
+  tools I need — `opentofu`, `kubectl`, `helm`, `kustomize`, `argocd` — is one `direnv allow`
+  away, pinned to known versions. No "first install these twelve things" page that's out of
+  date the moment I write it.
+
+## Try yourself
+
+The whole platform is on GitHub at
+[dannylongeuay/cyberdan-platform](https://github.com/dannylongeuay/cyberdan-platform), so you
+can see exactly how the pieces are wired together — the `apps/` folder is a good place to start
+if you want to follow the app-of-apps thread. A full step-by-step deploy guide (the
+command-by-command version of this post) is in the works.
+
+If there's one idea worth stealing from all this, it's treating git as the only control panel.
+Once the repo is the single source of truth and a few tools keep reality in sync with it, the
+boring work disappears into automation — and the time goes back into building the apps instead
+of babysitting the servers they run on.
