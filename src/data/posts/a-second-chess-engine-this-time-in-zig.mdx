@@ -1,0 +1,163 @@
+---
+title: "A Second Chess Engine, This Time in Zig"
+description: "Why I rebuilt my chess engine from scratch in Zig — what compile-time computation buys you, what changed since the Go version, and what doing it twice taught me."
+pubDate: 2026-05-29
+tags: ["zig", "chess", "algorithms", "ai", "uci"]
+---
+
+I already built a chess engine. [Vizzini](/posts/vizzini-a-chess-engine-in-pure-go/) — written in
+Go, plays a real game, runs as a bot — exists and works. So the obvious question about
+[`cyberdan-chess-solver`](https://github.com/dannylongeuay/cyberdan-chess-solver), my *second*
+chess engine, is: why build the same thing again?
+
+The honest answer is that I wanted to learn [Zig](https://ziglang.org/), and a chess engine turns
+out to be a near-perfect project for learning a systems language. It's small enough to finish, hard
+enough to be interesting, and — crucially — I already knew exactly what "correct" and "fast" were
+supposed to look like. There's a built-in answer key: standard test positions tell you instantly
+whether your move generation is right, and an engine I'd already written gave me something to
+benchmark against. Learning a language is much easier when you're not also figuring out the problem
+at the same time.
+
+> ### ♟️ Play it live: challenge it on **[Lichess](https://lichess.org/?user=cyberdan-chess#friend)**
+>
+> The solver runs as a Lichess bot, so you can play a full game against it in your browser right
+> now — no setup. It also powers a Computer mode over at
+> [chess.cyberdan.dev](https://chess.cyberdan.dev/).
+
+## The 30-second recap
+
+A chess engine does three things: it *sees* the board (stores a position in a form a computer can
+churn through), *looks ahead* (searches through possible moves and replies), and *judges* a
+position (boils it down to a single "who's winning" number). Get those three right and you have
+something that plays chess.
+
+I wrote all of that up in detail — bitboards, alpha-beta search, tapered evaluation, the whole
+tour — in the [post about the Go engine](/posts/vizzini-a-chess-engine-in-pure-go/). If you want
+the from-scratch explanation, start there. **This post is about what changed the second time
+around**, so I'll keep the fundamentals brief and spend the words on the differences.
+
+## Why Zig
+
+Zig and Go share a philosophy I happen to like: keep it small, keep it dependency-free, ship one
+self-contained binary. The solver, like Vizzini, has **zero external dependencies** — no chess
+libraries, no frameworks, just the language and its standard library. But Zig has one feature that
+genuinely changed how the engine is built: **`comptime`**, code that runs at *compile* time instead
+of when the program starts.
+
+Two of the engine's most performance-critical pieces are big lookup tables. The first is **magic
+bitboards** — precomputed tables that, given a sliding piece and the pieces blocking it, hand back
+its attacked squares in a single lookup instead of tracing rays across the board. The second is the
+set of **Zobrist keys**, the random numbers the engine uses to fingerprint a position so it can
+recognize one it has seen before.
+
+In the Go version, those tables had to be filled in at startup. In Zig, they're built *during
+compilation* and baked straight into the binary:
+
+```zig
+// Zobrist keys, generated at compile time and frozen into the executable
+pub const instance: Zobrist = blk: {
+    var z: Zobrist = undefined;
+    // ...fill the tables using a compile-time PRNG...
+    break :blk z;
+};
+```
+
+By the time the program runs, the tables already exist — there's no initialization step at all. It
+feels a little like magic the first time you see it: arbitrary computation, run by the compiler,
+with the *result* shipped instead of the code. Add to that manual control over memory (and no
+garbage collector pausing the engine mid-search), and Zig is a genuinely good fit for this kind of
+work.
+
+It's not all upside. Zig is young — the language still shifts between versions (this targets the
+0.15.x series), the ecosystem is thin, and you feel the rough edges. But for a self-contained,
+performance-sensitive program with no need for outside libraries, those downsides barely bite.
+
+## What got better the second time
+
+Building the same system again, I didn't just port the old one — I built the parts I understood
+better in the meantime, the right way, from the start.
+
+### An opening book
+
+The clearest difference: the solver has an **opening book**, and Vizzini deliberately didn't. The
+first dozen moves of a chess game are heavily studied theory — the good lines are essentially
+solved, and grinding through a deep search just to rediscover them is wasted effort. A book is a
+lookup table of known-good opening moves: if the current position is in the book, play straight from
+it and save the thinking for when it actually matters.
+
+I built the book from plain-text repertoire files — one for White, one for Black — that get parsed
+and compiled into fast lookups keyed by those same Zobrist fingerprints. When several book moves are
+available, the engine picks among them at random, so it doesn't march down the identical opening
+every single game.
+
+### Sharper search
+
+The search got a tune-up too. The core idea is the same as last time — look ahead, and prune away
+lines you can already prove are worse than something you've found — but the solver layers on
+refinements I understood better the second time around: **Principal Variation Search** (assume your
+first move is best and verify cheaply), **Static Exchange Evaluation** (work out whether a capture
+sequence actually wins material before spending search on it), and smarter move-ordering heuristics
+that learn which moves tend to be good and try them first. The payoff is a search that looks at far
+fewer positions to reach the same depth. The details live in `search.zig` if you want to read them.
+
+### A smarter memory
+
+Engines cache what they learn about positions in a *transposition table*, because different move
+orders often lead to the same board. The interesting question is what to do when the table fills up
+and you have to overwrite something. The solver's table tracks the *age* of each entry and prefers
+to evict stale ones — results from searches you've since moved past — before throwing away anything
+fresh and relevant. A small thing, but it keeps the cache earning its keep.
+
+## Four front doors
+
+Like Vizzini, the whole engine lives behind a single binary that can wear several hats, picked at
+startup:
+
+```sh
+zig build run               # interactive terminal game (default)
+zig build run -- uci        # UCI mode, for chess GUIs like Arena or CuteChess
+zig build run -- serve      # HTTP JSON API
+zig build run -- lichess    # connect to Lichess and play as a bot
+```
+
+Same brain every time — just a different way in. The `serve` mode is the one web apps talk to: it
+answers questions like "what are the legal moves here?" and "what's your best move?" over JSON, and
+it's exactly how the engine plugs into the
+[chessboard UI that knows nothing about the rules of chess](/posts/building-a-chess-ui-without-a-chess-engine/).
+
+## What doing it twice taught me
+
+The biggest surprise was how much *faster* the second build went — not because Zig is faster to
+write than Go (it isn't), but because I'd already paid the cost of figuring out the problem. I
+skipped every dead end from the first time and went straight for the architecture I wished I'd
+started with. Building something twice is an underrated way to find out which of your decisions were
+essential and which were just the first thing that worked.
+
+Having a known-good answer key mattered, too. Standard move-generation tests gave me an exact
+yes-or-no on correctness, and the existing engine gave me a sparring partner to measure strength
+against. I never had to wonder whether a change made things better — I could just play the two
+against each other and count.
+
+And the deepest lesson is almost reassuring: the hard-won part of the first engine — *understanding*
+how search and evaluation actually work — transferred completely. None of the Go code came along,
+but all of the understanding did. The language was the easy thing to swap out.
+
+## Try it yourself
+
+The quickest path is to [challenge the bot on
+Lichess](https://lichess.org/?user=cyberdan-chess#friend) or open
+[chess.cyberdan.dev](https://chess.cyberdan.dev/) and pick a Computer mode.
+
+To build it, you'll need Zig 0.15.x (or just [Nix](https://nixos.org/), which sets up the whole dev
+environment for you):
+
+```sh
+git clone https://github.com/dannylongeuay/cyberdan-chess-solver.git
+cd cyberdan-chess-solver
+zig build run        # play a game right in your terminal
+```
+
+The code is on GitHub at
+[dannylongeuay/cyberdan-chess-solver](https://github.com/dannylongeuay/cyberdan-chess-solver).
+Building the same thing twice sounds like a waste of time until you do it — and realize the second
+version is the one you actually wanted to build all along.

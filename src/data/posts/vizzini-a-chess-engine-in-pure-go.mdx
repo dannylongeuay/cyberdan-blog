@@ -1,0 +1,192 @@
+---
+title: "Vizzini: A Chess Engine in Pure Go"
+description: "How I built a UCI-compliant chess engine in Go — how it represents the board, searches for moves, judges a position, and plugs into a GUI, a web API, or a Lichess bot."
+pubDate: 2026-05-29
+tags: ["go", "chess", "algorithms", "ai", "uci"]
+---
+
+I built [Vizzini](https://github.com/dannylongeuay/vizzini), a chess engine written in Go. Give it any
+chess position and it will sit down, think it over, and tell you the best move it can find — the same job
+a grandmaster does, except it does it by counting to several billion. It's named after the loudmouth from
+*The Princess Bride* who declares himself the smartest man alive right before things go badly for him.
+The engine is more humble than its namesake, but it does enjoy a good battle of wits.
+
+> ### ♟️ Play it live: challenge it on **[Lichess](https://lichess.org/?user=vizzini-chess#friend)**
+>
+> Vizzini runs as a Lichess bot, so you can play a real game against it in your browser right now — no
+> setup required. It also powers the Computer modes over at
+> [chess.cyberdan.dev](https://chess.cyberdan.dev/).
+
+## What it does
+
+A chess engine is, at heart, a move-finder. You hand it a board, and it hands you back a move. Everything
+else is in service of doing that well: knowing the rules, looking ahead, and judging whether a position
+is good or bad.
+
+Vizzini knows the rules cold — not just how the pieces move, but all the fiddly edge cases that trip up
+naive implementations: castling, en passant, pawn promotion, check and checkmate, and draws by repetition
+or the 50-move rule. Getting those right is most of the work, and it's the part nobody notices until it's
+wrong.
+
+What makes it flexible is that the same engine has four different "front doors." A single program can be:
+
+- A **standard chess-GUI engine** that desktop apps like Arena or CuteChess can drive
+- An **interactive terminal game** you play move by move against a Unicode chessboard
+- An **HTTP API** that answers questions like "what are the legal moves here?" over JSON
+- A **Lichess bot** that accepts challenges and plays live games on its own
+
+That HTTP mode is how it connects to the web. In a [companion
+post](/posts/building-a-chess-ui-without-a-chess-engine/) I wrote about a chessboard frontend that knows
+nothing about the rules of chess and asks a server instead — Vizzini is one of the servers it asks.
+
+## How it thinks
+
+The interesting part is what happens between receiving a board and returning a move. It breaks down into
+three jobs: seeing the board, looking ahead, and judging a position.
+
+### Seeing the board
+
+Before an engine can do anything clever, it needs to represent the board in a way a computer can churn
+through quickly. The classic trick — and the one Vizzini uses — is **bitboards**.
+
+A chessboard has 64 squares, and a 64-bit integer has 64 bits. So you can describe "where are all the
+white pawns?" with a single number, where each bit that's flipped on marks a square that has a white pawn.
+Keep one of these numbers per piece type and you've captured the whole position. The payoff is that
+questions which sound slow become single CPU instructions: "which squares do these two sets of pieces
+share?" is just one bitwise AND.
+
+Sliding pieces — bishops, rooks, queens — are trickier, because what they attack depends on what's in
+their way. Vizzini handles this with **magic bitboards**: a precomputed set of lookup tables that, given a
+square and the pieces blocking it, returns the attacked squares in a single lookup instead of tracing rays
+across the board. It's the kind of optimization that looks like sorcery and is named accordingly. (See
+`bitboard.go` and `bitboard_tables.go` if you want to peek behind the curtain.)
+
+### Looking ahead
+
+A human player thinks ahead: *if I take that pawn, she takes back, then I have this fork…* An engine does
+the same thing, just far more exhaustively. The problem is that the number of possibilities explodes. From
+a typical middlegame position there are around 30 legal moves, each with 30 replies, each with 30 more —
+look just a few moves deep and you're staring at billions of positions. You can't check them all, so the
+whole art of search is **looking at as few of them as possible** while still finding the best move.
+
+Vizzini's search (in `search.go`) leans on a stack of well-worn techniques to do that:
+
+- **Iterative deepening** — instead of committing to "think 6 moves ahead," it thinks 1 move ahead, then
+  2, then 3, and so on, getting a usable answer at each step. That sounds wasteful, but it means the
+  engine can stop the moment it runs out of time and still hand back its best answer so far. It also makes
+  the next pass faster, because the good moves it found last time get checked first.
+- **Alpha-beta pruning** — the core money-saver. Once the engine proves that a line of play is worse than
+  one it has already found, it stops looking at that line entirely. There's no point finishing the
+  analysis of a move you already know you won't make.
+- **Move ordering** — pruning only pays off if you look at good moves first, so Vizzini guesses at the
+  promising ones up front: captures of valuable pieces, moves that worked in similar positions, and the
+  best move from previous searches. Good guesses here can shrink the search by orders of magnitude.
+- **Quiescence search** — a guard against stopping the analysis mid-trade. If the engine simply stopped
+  counting after 6 moves, it might evaluate a position right after capturing a queen but before the
+  recapture, and conclude it's winning. So at the edges of its search it keeps following captures and
+  checks until the dust settles and the position is quiet.
+
+Stacked together with a few more refinements — aspiration windows, null-move pruning, late-move
+reductions — these let the engine search much deeper than brute force ever could.
+
+### Judging a position
+
+Eventually the look-ahead has to stop and the engine has to answer a blunt question: *is this position
+good for me?* That's the job of **evaluation** (`evaluate.go`), which boils a position down to a single
+number measured in centipawns — hundredths of a pawn. A score of +150 means "I'm up about a pawn and a
+half."
+
+The starting point is just counting material — a queen is worth more than a rook, a rook more than a
+bishop, and so on. But raw material isn't enough; *where* the pieces sit matters too. Vizzini uses
+**piece-square tables**, which nudge the score based on placement: a knight in the center of the board is
+worth more than the same knight stranded in a corner, a king is safer tucked behind its pawns in the
+middlegame, and so on.
+
+The clever twist is **tapered evaluation**. What counts as a good position changes over the course of a
+game — early on, king safety is everything; in the endgame, with few pieces left, the king becomes a
+fighting piece and pushing a pawn to promotion is what wins. So Vizzini keeps two sets of scores, one for
+the opening/middlegame and one for the endgame, and smoothly blends between them based on how many pieces
+are still on the board. Priorities shift gradually as the game winds down, with no jarring jump at some
+arbitrary "now it's the endgame" line.
+
+On top of that it weighs mobility (how many safe squares your pieces can reach), king safety (pawn shields
+and enemy pieces crowding around your king), and a bonus for keeping both bishops. A rough sketch of the
+material values gives the flavor:
+
+```go
+// Midgame / endgame values, in centipawns
+Pawn:   100 / 120
+Knight: 320 / 280
+Bishop: 330 / 300
+Rook:   500 / 520
+Queen:  900 / 950
+```
+
+Notice the knight is worth *less* in the endgame and the rook a bit *more* — that's the tapering at work,
+encoding the way pieces change value as the board empties out.
+
+## Four ways to run it
+
+That whole brain — see, search, judge — sits behind a single binary that can wear four different hats,
+chosen at startup in `main.go`:
+
+```sh
+./bin/vizzini          # interactive game in your terminal
+./bin/vizzini uci      # UCI mode, for chess GUIs like Arena or CuteChess
+./bin/vizzini serve    # HTTP JSON API on port 8080
+./bin/vizzini lichess  # connect to Lichess and play as a bot
+```
+
+The HTTP mode is the one web apps talk to. It exposes a handful of endpoints — ask for the legal moves in
+a position, submit a move and get the new position back, or ask the engine for its best move — all
+speaking [FEN](https://en.wikipedia.org/wiki/Forsyth%E2%80%93Edwards_Notation), the compact one-line
+notation for a chess position. Same brain every time; just a different front door.
+
+## Built in plain Go
+
+Vizzini has **zero external dependencies**. The whole thing — bitboards, search, evaluation, the HTTP
+server, the Lichess client — is built on Go's standard library and nothing else. No chess libraries, no
+opening books loaded from disk, no C extensions for speed. As the README puts it: *"I built this with
+nothing but my wits and a Go compiler."*
+
+That choice pays off when it's time to ship. The engine compiles to one small, self-contained binary,
+which means the Docker image can be a multi-stage build that ends up as a near-empty `scratch` container
+with little more than the binary inside. There's nothing to install, nothing to keep in sync, and the
+whole codebase is small enough to read end to end.
+
+## A few things worth calling out
+
+- **Tapered evaluation for smooth transitions.** Blending midgame and endgame scores by phase, rather than
+  flipping a switch at some piece count, keeps the engine from suddenly changing its mind about what a
+  position is worth as pieces come off.
+- **A transposition table.** Different move orders often reach the same position, so the engine caches what
+  it learned about positions it has already analyzed — a 2-million-entry table — and skips re-doing the
+  work when it sees an old position again.
+- **It doesn't always play the same game.** A pure engine is deterministic: feed it the same position and
+  it makes the same move every time, which gets dull. Vizzini sprinkles in a few centipawns of random
+  noise and, for the first several moves, picks probabilistically among the moves that are nearly as good
+  as the best one. The result is more varied openings without throwing away strength — and it switches all
+  of that off the moment it spots a forced mate, because some moments call for precision, not personality.
+
+## Try it yourself
+
+The quickest way is to just [challenge the bot on
+Lichess](https://lichess.org/?user=vizzini-chess#friend), or open
+[chess.cyberdan.dev](https://chess.cyberdan.dev/) and pick a Computer mode.
+
+To run it yourself, you'll need Go 1.25+:
+
+```sh
+git clone https://github.com/dannylongeuay/vizzini.git
+cd vizzini
+go build -o bin/vizzini ./src/...
+./bin/vizzini          # play a game right in your terminal
+```
+
+If you've got [`just`](https://github.com/casey/just) installed, `just run` does the build-and-run in one
+step, and `just serve` starts the HTTP API. The code is on GitHub at
+[dannylongeuay/vizzini](https://github.com/dannylongeuay/vizzini).
+
+It turned out to be a great way to appreciate just how much is going on behind a move that a strong player
+makes in seconds — the seeing, the looking ahead, the judging. Vizzini's namesake would no doubt call the
+whole thing inconceivable. I do not think that word means what he thinks it means.
