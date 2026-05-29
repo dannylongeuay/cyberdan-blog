@@ -1,0 +1,168 @@
+---
+title: "Building a Chess UI Without a Chess Engine"
+description: "How I built an interactive chess frontend in React that delegates every move to a swappable backend engine."
+pubDate: 2026-05-29
+tags: ["react", "typescript", "vite", "tailwindcss", "chess", "webdev"]
+---
+
+I built [cyberdan-chess-ui](https://github.com/dannylongeuay/cyberdan-chess-ui), a chess
+app you can open in a browser and play right away. It draws the board, lets you drag
+pieces around, shows you where they can go, and tells you when someone's in check. But
+here's the twist that makes it interesting to write about: **the frontend doesn't know
+the rules of chess.** It can't tell a legal move from an illegal one on its own. It asks
+something else.
+
+> ### ♟️ Play it live: **[chess.cyberdan.dev](https://chess.cyberdan.dev/)**
+>
+> It's fully hosted — both backend engines run in the same infrastructure, so every mode
+> works out of the box: play a friend in hotseat, take on the computer as White or Black,
+> or set two engines loose on each other. No setup required.
+
+## What it does
+
+Before the under-the-hood part, here's what you actually get as a player:
+
+- **Three ways to play.** Human vs Human on the same screen (hotseat), Human vs Computer
+  where you pick White or Black, or Computer vs Computer where you sit back and watch two
+  engines fight it out.
+- **Move pieces however you like.** Click a piece and click a destination, or drag and
+  drop it. When you pick up a piece, the squares it can move to light up — a dot for an
+  empty square, a ring for a capture.
+- **Visual feedback that keeps you oriented.** The last move stays highlighted, a king in
+  check gets a red glow, and promoting a pawn pops up a little dialog so you can choose a
+  queen, rook, bishop, or knight.
+- **An evaluation bar.** When you're playing against the computer, a bar shows who the
+  engine thinks is winning and by how much.
+- **Adjustable difficulty.** You can tune how deeply the computer thinks (search depth)
+  and how long it's allowed to ponder (a timeout) to make it sharper or gentler.
+
+There's also a button to flip the board and one to start a fresh game. Nothing exotic —
+it's meant to feel like every other online chessboard you've used.
+
+## The twist: a frontend with no rules
+
+Most chess apps bundle an engine right into the page. The same code that draws the board
+also knows that bishops move diagonally, that you can't leave your own king in check, and
+that three repeated positions is a draw. That works, but it ties the look-and-feel to one
+particular rules implementation.
+
+This app splits those jobs apart. The frontend is the **chessboard and the courier** — it
+shows the position and ferries moves back and forth — but it is *not* the **referee**. The
+refereeing happens on a server. When you grab a piece, the UI essentially asks, "what are
+the legal moves here?" When you drop it, it asks, "is this move okay, and what does the
+board look like now?" And when it's the computer's turn, it asks, "what's your best move?"
+
+The payoff is that any engine can sit behind that conversation. In production the UI talks
+to two of them — `chess-solver.cyberdan.dev` and `vizzini.cyberdan.dev` — and Computer vs
+Computer mode literally points one engine at each side and lets them play. Swapping in a
+stronger or stranger engine doesn't require touching the board code at all.
+
+## How it's built
+
+The frontend is a fairly standard modern stack: **React 19**, **TypeScript**, **Vite** for
+the build and dev server, **TailwindCSS** for styling, and **Bun** as the package manager
+and runtime. There's no Redux or other state library — all the game state lives in React
+hooks.
+
+The common language between the UI and the engine is **FEN** — a compact one-line string
+that describes an entire chess position (where every piece is, whose turn it is, castling
+rights, and so on). The UI holds the current position as a FEN string and sends it to the
+server on every request; the server sends back a new FEN after each move. Neither side has
+to agree on anything more complicated than that string.
+
+The entire conversation with the backend is just three POST requests. Here's the whole API
+client:
+
+```typescript
+export const api = {
+  getValidMoves(baseUrl: string, fen: string, signal?: AbortSignal): Promise<ValidMovesResponse> {
+    return apiFetch<ValidMovesResponse>(baseUrl, '/validmoves', { fen }, signal);
+  },
+
+  submitMove(baseUrl: string, fen: string, move: string, signal?: AbortSignal): Promise<SubmitMoveResponse> {
+    return apiFetch<SubmitMoveResponse>(baseUrl, '/submitmove', { fen, move }, signal);
+  },
+
+  submitBestMove(baseUrl: string, fen: string, depth: number, timeoutMs: number, signal?: AbortSignal): Promise<SubmitBestMoveResponse> {
+    return apiFetch<SubmitBestMoveResponse>(baseUrl, '/submitbestmove', { fen, depth, timeout_ms: timeoutMs }, signal);
+  },
+};
+```
+
+That's it. `validmoves` for the legal moves in a position, `submitmove` for a human move,
+and `submitbestmove` for the computer's move (with the depth and timeout knobs from the
+difficulty controls). Because every engine speaks this same little contract, picking which
+one to use is just a list:
+
+```typescript
+const PROD_BACKENDS: Backend[] = [
+  { label: 'Cyberdan', url: 'https://chess-solver.cyberdan.dev' },
+  { label: 'Vizzini', url: 'https://vizzini.cyberdan.dev' },
+];
+
+export const BACKENDS = import.meta.env.DEV ? DEV_BACKENDS : PROD_BACKENDS;
+```
+
+Adding a new engine to the dropdown is one line. In development it points at a local
+server instead, chosen automatically by Vite's `import.meta.env.DEV` flag.
+
+All of the actual game logic — current position, whose turn it is, which square is
+selected, and orchestrating the computer's moves — lives in a single hook,
+`useChessGame`. Keeping it in one place means the components stay dumb: the board just
+renders whatever the hook hands it and reports clicks back.
+
+One small optimization worth calling out: the legal moves for the *next* position come
+bundled in the response to every `submitmove` call, so the UI caches them keyed by FEN.
+When you then pick up a piece, it already knows where that piece can go — no extra
+round-trip to the server:
+
+```typescript
+// The moves should already be cached from pointerdown
+if (movesCache.current?.fen === fen) {
+  const fromAlg = coordToAlgebraic(from);
+  const moves = movesCache.current.response.moves.filter((m) => m.from === fromAlg);
+  tryMove(from, to, moves);
+}
+```
+
+So selecting a piece feels instant even though the rules live on a server somewhere else.
+
+## A few things I'd do again
+
+- **Cancelable requests.** Computer moves go out with an `AbortController`, so if you
+  start a new game while the engine is thinking, the stale request gets cancelled instead
+  of arriving late and stomping on the fresh board.
+- **Always show the eval from the human's side.** The engine reports the score from its
+  own perspective; the UI normalizes it so the evaluation bar always reads from *your*
+  point of view. Small detail, but it stops the bar from feeling backwards.
+- **Letting the backend own the rules kept the UI tiny.** The whole frontend is only
+  around 1,400 lines of code. There's no move generator, no check detection, no draw
+  logic to maintain — that complexity lives behind the API where any engine can own it.
+
+## Try it yourself
+
+The easiest way is to just open **[chess.cyberdan.dev](https://chess.cyberdan.dev/)** — the
+UI and both engines (`chess-solver.cyberdan.dev` and `vizzini.cyberdan.dev`) are all
+hosted together, so you can jump straight into any mode: Human vs Human, Human vs
+Computer, or Computer vs Computer.
+
+If you'd rather run it yourself, the app runs locally with Bun:
+
+```bash
+bun install
+bun run dev
+```
+
+It expects an engine to talk to, configured via the `VITE_API_URL` environment variable
+(defaults to `http://localhost:8080`). There's also a Docker image that builds with Bun
+and serves with Nginx:
+
+```bash
+docker run -p 8080:80 cyberdan-chess-ui
+```
+
+The code is on GitHub at
+[dannylongeuay/cyberdan-chess-ui](https://github.com/dannylongeuay/cyberdan-chess-ui). It
+turned out to be a fun reminder that a clean boundary — here, three little POST requests —
+can keep one half of a project simple while the hard, interesting work happens on the
+other side of the line.
