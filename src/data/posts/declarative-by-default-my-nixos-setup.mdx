@@ -1,0 +1,660 @@
+---
+title: "Declarative Workstation Setup"
+description: "Why I run NixOS, how my flake and modules are structured across three machines, and a full walkthrough of every package I install and what it replaced."
+pubDate: 2026-05-31
+tags: ["nixos", "nix", "linux", "hyprland", "flakes", "home-manager", "dotfiles"]
+---
+
+I have three computers I work on: a desktop, a laptop, and a work MacBook. All three
+of those machines are described by a single git repository.
+The desktop and laptop run [NixOS](https://nixos.org/); the Mac runs
+[nix-darwin](https://github.com/LnL7/nix-darwin). When I want a new tool, I add a line to a
+`.nix` file and rebuild. When something breaks, I roll back to the previous generation and the
+machine is *exactly* what it was before. There are no untracked changes, because untracked
+changes don't survive a rebuild.
+
+> ### ❄️ The whole thing is public
+>
+> Everything described here lives at
+> **[github.com/dannylongeuay/nixos-config](https://github.com/dannylongeuay/nixos-config)**.
+> If a module looks useful, steal it — that's most of what the repo is good for.
+
+This post is in three parts: **why** I picked NixOS over other popular distros, **how** the flake and
+modules are organized, and then a long **walkthrough of every package** I install and the
+conventional tool it replaces. The package tour is the bulk of it, and it doubles as a tour of
+what a terminal-first, keyboard-driven Linux desktop looks like in 2026.
+
+## Why NixOS over Arch, Fedora, or Ubuntu
+
+On a normal distro you configure your system by **doing things**:
+`pacman -S` this, edit that file in `/etc`, enable this systemd service, drop a script in
+`~/.local/bin`. Each action is a one-time imperative mutation, and the real state of the machine
+is the sum of every mutation you've ever made, most of which you've forgotten.
+
+The result is *drift*. Six months in, your laptop and your desktop have diverged in a hundred
+small ways you can't enumerate, and reinstalling means rediscovering all of them. Your dotfiles
+repo captures *some* of it, but not the system packages, not the services, not the kernel
+parameters, not the font config.
+
+NixOS flips the model. Instead of describing a sequence of changes, you describe the **end state
+you want**, declaratively, in the Nix language. Then `nixos-rebuild` makes the machine match that
+description. The whole system — bootloader, kernel, drivers, services, packages, user dotfiles —
+is one big expression that evaluates to one big result. A few properties fall out of this that I
+now find hard to live without:
+
+- **Reproducibility.** The same config plus the same pinned inputs produces the same system,
+  on any machine. My desktop and laptop genuinely share their configuration instead of
+  approximating each other.
+- **Atomic upgrades and rollbacks.** Every rebuild creates a new *generation*. If an update
+  breaks something, I pick the previous generation from the boot menu — or run one rollback
+  command — and I'm back. The old generation was never mutated; it was sitting there the whole
+  time.
+- **No drift.** Anything not written in the repo doesn't exist after a rebuild. There's no
+  "mystery setting from 2023." If I want to understand why my machine behaves a certain way, I
+  read the config. It's all there, in git.
+- **One repo, many machines.** Adding a machine is writing two small files and wiring them into
+  the flake, not repeating a setup ritual.
+
+There are trade-offs. The Nix language has a steep learning
+curve and a reputation for it that's mostly earned. Documentation is improving, but I've found my self
+going down the rabbit hole of Google and forums to figure some things out. For me
+the payoff is a system I understand and can rebuild from scratch in minutes.
+
+## The flake: one repo, three machines
+
+The entry point is `flake.nix`. A [flake](https://nixos.wiki/wiki/Flakes) is just a standardized
+way to package Nix code with pinned dependencies — its inputs are locked in `flake.lock`, so the
+build is reproducible down to the exact revision of every dependency. Here's the whole input
+section:
+
+```nix
+inputs = {
+  nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
+  home-manager = {
+    url = "github:nix-community/home-manager";
+    inputs.nixpkgs.follows = "nixpkgs";
+  };
+  nix-darwin = {
+    url = "github:LnL7/nix-darwin";
+    inputs.nixpkgs.follows = "nixpkgs";
+  };
+  catppuccin.url = "github:catppuccin/nix";
+  claude-code.url = "github:sadjow/claude-code-nix";
+};
+```
+
+Five inputs, each pinned:
+
+- **`nixpkgs`** on the `nixos-unstable` channel — the rolling-release package set. I want recent
+  packages and I'm comfortable on unstable; it's been very stable in practice.
+- **`home-manager`** — manages the *user* level (dotfiles, shell, editor) as opposed to the
+  system level. More on the split below.
+- **`nix-darwin`** — the macOS equivalent of `nixos-rebuild`, so the work Mac is managed by the
+  same kind of config.
+- **`catppuccin`** — theme modules that paint everything from the TTY to the status bar in one
+  consistent palette.
+- **`claude-code`** — a community overlay that keeps [Claude Code](https://www.anthropic.com/claude-code)
+  packaged and up to date.
+
+The `inputs.nixpkgs.follows = "nixpkgs"` lines are a small but important detail: they force
+`home-manager` and `nix-darwin` to use *my* `nixpkgs` instead of their own pinned copies. Without
+that, I'd be building against two or three different `nixpkgs` revisions and bloating the store
+with duplicate closures.
+
+The outputs define one entry per machine. Two NixOS systems, one Darwin system, and a
+home-manager configuration for each:
+
+```nix
+nixosConfigurations.desktop = lib.nixosSystem {
+  inherit system;
+  inherit pkgs;
+  modules = [
+    ./modules/nixos/hosts/desktop
+    catppuccin.nixosModules.catppuccin
+  ];
+};
+homeConfigurations."cyberdan@desktop" = home-manager.lib.homeManagerConfiguration {
+  inherit pkgs;
+  modules = [
+    ./modules/home-manager/user/cyberdan/desktop.nix
+    catppuccin.homeModules.catppuccin
+    { home.packages = [ pkgs.claude-code ]; }
+  ];
+};
+```
+
+The `pkgs` everything shares is built once, with unfree software allowed (for the NVIDIA driver
+and Steam) and the `claude-code` overlay applied:
+
+```nix
+pkgs = import nixpkgs {
+  system = system;
+  config.allowUnfree = true;
+  overlays = [ claude-code.overlays.default ];
+};
+```
+
+### Why system and user are kept separate
+
+One deliberate choice worth calling out: **home-manager runs standalone, not as a NixOS module.**
+The system level (NixOS / nix-darwin) and the user level (home-manager) are applied with separate
+commands:
+
+```sh
+sudo nixos-rebuild switch --flake .#desktop                # system level
+home-manager switch --flake .#cyberdan@desktop             # user level
+```
+
+I could have bolted home-manager onto NixOS so one `nixos-rebuild` did both. I keep them split on
+purpose. The user level (shell config, editor, dotfiles) is where I iterate constantly, and I
+want to rebuild *just that* without touching the system configuration. It also means the
+exact same home-manager modules work unchanged on the Mac, where there's no NixOS underneath them
+at all. The price is remembering to run two commands; in practice they're one-letter abbreviations
+(`nos` and `nhs`), so it's a non-issue.
+
+## The module layout
+
+The repo is organized as a tree of small, single-purpose modules. The shape:
+
+```
+flake.nix                     # inputs + all machine outputs
+modules/
+├── nixos/                    # system level
+│   ├── common/               # boot, nix, networking, fonts, services, user, …
+│   ├── gui/                  # hyprland, steam
+│   ├── nvidia/               # graphics + drivers
+│   ├── sound/                # pipewire
+│   └── hosts/
+│       ├── desktop/          # default.nix + hardware-configuration.nix
+│       └── laptop/           # default.nix + hardware-configuration.nix
+├── home-manager/             # user level
+│   ├── common/               # cross-platform packages, programs, theme
+│   ├── shell/                # fish (+tide), zsh, bat, fzf, zoxide, direnv
+│   ├── tui/                  # helix (+ LSPs), yazi, bottom, k9s
+│   ├── gui/                  # kitty, hyprland stack, zathura, theme
+│   ├── vc/                   # git, delta, gh
+│   └── user/
+│       ├── cyberdan/         # common.nix + desktop.nix + laptop.nix
+│       └── daniel.longeuay/  # workLaptop.nix + aerospace.toml
+└── nix-darwin/
+    └── hosts/workLaptop.nix  # macOS system (homebrew casks, defaults)
+```
+
+The pattern that makes this scale: **a host file is thin, and it imports fat shared modules.**
+A NixOS host just sets what's unique to that machine, then pulls in the shared feature subtrees.
+Here's the desktop's `default.nix`, essentially in full:
+
+```nix
+{
+  networking.hostName = "desktop";
+  users.users.cyberdan = { ... };
+  hardware.logitech.wireless.enable = true;
+  nix.gc.dates = "03:00";
+  imports = [
+    ./hardware-configuration.nix
+    ../../common
+    ../../gui
+    ../../nvidia
+    ../../sound
+  ];
+}
+```
+
+That's the *whole* difference between the desktop and the laptop, give or take: a hostname, the
+hardware config that `nixos-generate-config` produced, a couple of machine-specific options, and
+which feature subtrees to import. Everything substantial lives in `common`, `gui`, `nvidia`, and
+`sound`, shared between both.
+
+The user side mirrors this. The per-host home file sets host variables and rebuild
+abbreviations, then imports a shared `common.nix`. Here's the laptop's, in full:
+
+```nix
+{
+  programs.fish.shellAbbrs = {
+    hms = "home-manager switch --flake .#cyberdan@laptop";
+    nhs = "nh home switch --ask --configuration cyberdan@laptop .";
+    nrs = "sudo nixos-rebuild switch --flake .#laptop";
+    nos = "nh os switch --ask --hostname laptop .";
+  };
+
+  hyprland_input_sensitivity = -0.6;
+  hyprland_startup_apps = [
+    "[workspace 1 silent] firefox"
+    "[workspace 2 silent] kitty"
+  ];
+  imports = [ ./common.nix ];
+}
+```
+
+Those bare attributes like `hyprland_input_sensitivity` and `hyprland_startup_apps` are custom
+options the modules read, allowing custom configurations between machines. It's a clean way to
+parameterize a shared module per-host without `if hostname == ...` branching scattered everywhere.
+
+One flake gotcha that bites every newcomer, straight from my README:
+
+> **Gotcha:** flake evaluation only sees files tracked by git. After creating new files (a new
+> host, a copied `hardware-configuration.nix`, etc.) you **must** `git add -A` before rebuilding,
+> or Nix won't find them.
+
+## The system layer
+
+The `modules/nixos/common` tree and its siblings describe everything below the user: boot,
+kernel, drivers, audio, networking. The highlights, with the reasoning:
+
+**Bootloader and kernel.** systemd-boot instead of GRUB — it's simpler, faster, and I boot via
+UEFI anyway. The kernel is the Zen kernel, tuned for desktop responsiveness over raw throughput:
+
+```nix
+boot.loader.systemd-boot.enable = true;
+boot.loader.efi.canTouchEfiVariables = true;
+boot.kernelPackages = pkgs.linuxPackages_zen;
+```
+
+**Display server: Wayland, no display manager.** The desktop is [Hyprland](https://hyprland.org/),
+a Wayland compositor. There's no login greeter — Hyprland starts its own session, and I
+explicitly disable LightDM (which NixOS would otherwise pull in as the default once X is enabled).
+`NIXOS_OZONE_WL = "1"` is set so Electron and Chromium apps run natively on Wayland instead of
+through XWayland.
+
+> When the machine starts, I am dropped into a TTY session. I then start Hyprland with the aptly named
+`start-hyprland` command.
+
+**Audio: PipeWire.** PipeWire replaces PulseAudio as the audio server, with the ALSA and PulseAudio
+compatibility shims enabled (and 32-bit ALSA support, so Steam games are happy). `security.rtkit`
+gives audio real-time scheduling priority:
+
+```nix
+services.pipewire = {
+  enable = true;
+  alsa.enable = true;
+  alsa.support32Bit = true;
+  pulse.enable = true;
+};
+security.rtkit.enable = true;
+```
+
+**Graphics: NVIDIA proprietary.** I run the closed-source NVIDIA driver (`open = false`) with
+modesetting on and 32-bit graphics enabled for Steam/Proton. NVIDIA on Wayland used to be a
+horror story; these days it's mostly fine with modesetting and the right environment variables
+(which the Hyprland module sets: `LIBVA`, `GBM`, `GLX` all pointed at NVIDIA).
+
+**Networking** is NetworkManager. **Localization** is `en_US.UTF-8` with the timezone set to
+`America/New_York`. A handful of services round it out: CUPS for printing, libinput for
+input devices, and upower for battery status.
+
+**Nix itself** is configured to enable flakes and garbage-collect old generations automatically:
+
+```nix
+nix = {
+  settings = {
+    experimental-features = [ "nix-command" "flakes" ];
+    warn-dirty = false;
+    trusted-users = [ "root" "@wheel" ];
+  };
+  gc = {
+    automatic = true;
+    options = "--delete-older-than 30d";
+  };
+};
+```
+
+Generations older than 30 days get cleaned up on a per-host schedule (the desktop runs GC at
+03:00, the laptop at 20:00). That keeps the rollback safety net around for a month without letting
+the Nix store grow forever.
+
+**Fonts** are a set of Nerd Fonts — patched fonts that include the icon glyphs the status bar and
+prompt rely on — with JetBrains Mono as the primary face.
+
+## The package walkthrough
+
+Now the main event. The philosophy across the whole config is **modern, terminal-first
+replacements for traditional Unix tools**. The shell
+abbreviations don't just offer `eza`; they make `ls` *mean* `eza`. Where there's a conventional
+tool being replaced, I'll name it.
+
+A note on scope: only two packages live at the system level —
+
+```nix
+environment.systemPackages = [ helix vim ];
+```
+
+— Helix and Vim, present system-wide so there's always an editor in a rescue shell even before
+home-manager runs. *Everything else* is installed per-user through home-manager, which is exactly
+where user tooling belongs.
+
+### Shell and prompt
+
+The interactive shell is [Fish](https://fishshell.com/), but with a twist. The login shell is
+technically Zsh, which immediately execs into Fish:
+
+```nix
+programs.zsh = {
+  enable = true;
+  dotDir = config.home.homeDirectory;
+  initContent = lib.mkBefore "exec ${pkgs.fish}/bin/fish";
+};
+```
+
+Why the dance? Fish isn't POSIX-compatible, which occasionally upsets tooling that expects a
+POSIX login shell. Keeping Zsh as the registered shell sidesteps that whole category of problem,
+while the `exec` means every interactive session is *actually* Fish from the first prompt. I get
+Fish's autosuggestions and sane defaults without the compatibility headaches.
+
+The prompt is [Tide](https://github.com/IlanCosman/tide), themed in painstaking detail to match
+Catppuccin — every segment (git, kubernetes context, AWS profile, nix shell, language versions)
+gets its colors from the palette. Alongside it, [`fzf.fish`](https://github.com/PatrickF1/fzf.fish)
+wires the fuzzy finder into the shell's history and file search.
+
+A few small touches in the Fish config I'm fond of. `fish_greeting` runs `fastfetch` so every new
+shell shows system info. And there's this bit of self-discipline:
+
+```nix
+shellAbbrs = {
+  c = "clear";
+  # break muscle memory
+  clear = "# stop typing 'clear', use 'c' instead!";
+};
+```
+
+Typing `clear` expands to a comment that scolds me into using `c`. Petty, effective.
+
+### Modern coreutils replacements
+
+This is the heart of the "terminal-first replacements" idea. Each of these is aliased over the
+classic tool it improves on:
+
+| Tool | Replaces | Why |
+| --- | --- | --- |
+| [`eza`](https://eza.rocks/) | `ls` | Colors, icons, git status, tree view. `ls` → `eza`, `ll` → `eza -la`. |
+| [`fd`](https://github.com/sharkdp/fd) | `find` | Sane syntax, fast, respects `.gitignore` by default. `find` → `fd`. |
+| [`ripgrep`](https://github.com/BurntSushi/ripgrep) | `grep` | Recursive, fast, gitignore-aware. `grep` → `rg`. |
+| [`bat`](https://github.com/sharkdp/bat) | `cat` | Syntax highlighting and a built-in pager. |
+| [`zoxide`](https://github.com/ajeetdsouza/zoxide) | `cd` | Frecency-based jumping — `z proj` takes me to the directory I visit most matching "proj". |
+| [`fzf`](https://github.com/junegunn/fzf) | — | The fuzzy finder everything else builds on. |
+| [`jq`](https://jqlang.github.io/jq/) | — | JSON slicing and transforming. |
+| [`ncdu`](https://dev.yorhel.nl/ncdu) | `du` | Interactive disk-usage browser for "what ate my disk." |
+| [`httpie`](https://httpie.io/) | `curl` | Human-friendly HTTP client (`http GET ...`). |
+| [`just`](https://github.com/casey/just) | `make` | A command runner without Make's tab-sensitivity and build-graph baggage. |
+| [`watchexec`](https://github.com/watchexec/watchexec) | `entr` | Re-run a command whenever files change. Aliased to `we`. |
+| [`fastfetch`](https://github.com/fastfetch-cli/fastfetch) | `neofetch` | System info; neofetch is unmaintained now. |
+| [`libqalculate`](https://qalculate.github.io/) | `bc` | A genuinely powerful calculator (`qalc`), units and all. |
+
+You can see the choices that *didn't* make the cut sitting in comments in `packages.nix` — `xh`
+as a Rust alternative to httpie, `mask` as a markdown-defined task runner instead of `just`,
+`television` as an fzf alternative. The config doubles as a lab notebook of tools I've evaluated.
+
+### Nix-specific tooling
+
+A few tools exist specifically to make living *on* Nix pleasant:
+
+- [`nh`](https://github.com/nix-community/nh) (Nix Helper) — a friendlier wrapper around
+  `nixos-rebuild` and `home-manager`. Its `--ask` flag shows a build/diff preview before
+  activating, so I can see what a rebuild will change before I commit to it. This is what `nos`
+  and `nhs` actually call.
+- [`direnv`](https://direnv.net/) + [`nix-direnv`](https://github.com/nix-community/nix-direnv) —
+  per-directory environments. Drop a `.envrc` in a project and the right `nix develop` shell loads
+  the moment I `cd` in, with caching so it's instant.
+- [`nix-your-shell`](https://github.com/MercuryTechnologies/nix-your-shell) — keeps me in Fish when
+  I enter a `nix shell` or `nix develop`, instead of getting dumped into bash.
+- [`nix-search-tv`](https://github.com/3timeslazy/nix-search-tv) — an interactive fuzzy search over
+  nixpkgs. I wrap its helper script as a tiny `ns` command:
+
+  ```nix
+  (pkgs.writeShellScriptBin "ns"
+    (builtins.readFile "${pkgs.nix-search-tv.src}/nixpkgs.sh"))
+  ```
+
+  Searching for a package before adding it is constant, so having it one keystroke away matters.
+
+### Editor: Helix
+
+My editor is [Helix](https://helix-editor.com/), set as the default editor system-wide. It's a
+modal editor in the Vim/Kakoune lineage, but with a selection-first model (you select, *then* act)
+and — the part that sold me — language servers and tree-sitter built in, no plugin ecosystem to
+assemble. Coming from years of hand-tending a Neovim config, having a batteries-included editor
+that "just works" with LSP out of the box is a relief.
+
+The config is small. A few editor preferences:
+
+```nix
+settings.editor = {
+  mouse = false;
+  line-number = "relative";
+  cursor-shape = { insert = "bar"; select = "underline"; };
+  inline-diagnostics.cursor-line = "hint";
+};
+```
+
+The real substance is the language tooling. Helix gets a pile of language servers and formatters
+declared right alongside it as `extraPackages`, so they're always on `PATH` when Helix needs them:
+`nil` (Nix), `lua-language-server`, `bash-language-server`, `marksman` and `ltex-ls` (Markdown +
+grammar), `taplo` (TOML), `yaml-language-server`, `terraform-ls`, `dockerfile-language-server`,
+`vscode-langservers-extracted` (HTML/CSS/JSON/ESLint), `jq-lsp`, `cuelsp`, and `deno` for
+TypeScript. Per-language formatting is wired up to run on save where it makes sense — `nixpkgs-fmt`
+for Nix, `goimports` for Go, `ruff`/`pyright` for Python, `ocamlformat` for OCaml. This is the
+NixOS payoff again: my editor's entire language toolchain is declared in one file and reproduces
+perfectly on every machine.
+
+### Terminal: Kitty
+
+The terminal emulator is [Kitty](https://sw.kovidgoyal.net/kitty/) — GPU-accelerated, fast, and
+configured in plain text. The config is minimal: JetBrains Mono Nerd Font at 14pt, no audio bell,
+no "are you sure?" on close. It beats Alacritty for me mainly on built-in features (tabs, splits,
+graphics protocol) without needing a multiplexer for basic things.
+
+### File manager and system monitors
+
+- [`yazi`](https://yazi-rs.github.io/) — a fast TUI file manager (the modern answer to `ranger`
+  or `lf`), aliased to `yy`. Great for bulk operations and previewing files without leaving the
+  terminal.
+- [`bottom`](https://github.com/ClementTsang/bottom) — a resource monitor (`btm`) replacing
+  `top`/`htop`, with nicer graphs.
+- [`k9s`](https://k9scli.io/) — a Kubernetes TUI. Since I run [a whole platform on
+  Kubernetes](/posts/the-platform-that-deploys-itself/), having a fast cluster dashboard in the
+  terminal is essential.
+
+### Version control: git, delta, gh
+
+Git, of course — but with two companions. [`delta`](https://github.com/dandavison/delta) replaces
+git's default diff pager with syntax-highlighted, side-by-side, navigable diffs:
+
+```nix
+programs.delta = {
+  enable = true;
+  enableGitIntegration = true;
+  options = { navigate = true; line-numbers = true; side-by-side = true; };
+};
+```
+
+And [`gh`](https://cli.github.com/), the GitHub CLI, configured to use SSH. Git itself is set up
+with OpenPGP commit signing, `main` as the default branch, and `diff3` conflict style (which shows
+the common ancestor in conflicts — much easier to resolve).
+
+The fun part is the workflow layer built on top in Fish. There's the usual pile of abbreviations
+(`gs` → `git status`, `ga` → `git add -A`, `gco` → checkout, and so on), but also a set of
+conventional-commit helpers. A small `_gcm` function builds a properly formatted commit message,
+and these wrap it with a type and an emoji:
+
+```nix
+gfeat = "_gcm feat \":sparkles:\" $argv";
+gfix = "_gcm fix \":bug:\" $argv";
+gperf = "_gcm perf \":zap:\" $argv";
+gchore = "_gcm chore \":wrench:\" $argv";
+grefactor = "_gcm refactor \":recycle:\" $argv";
+```
+
+So `gfeat "add the thing"` produces `feat(*): :sparkles: add the thing`. If you scroll through
+this repo's commit history you'll see exactly that format — it's self-hosting.
+
+### Cloud and Kubernetes
+
+The infra tooling: `kubectl` (aliased to `k`), `awscli2`, and `doctl` (the DigitalOcean CLI, since
+[that's where my cluster lives](/posts/the-platform-that-deploys-itself/)). The nice ergonomic
+touches are again Fish functions that pair these with `fzf`:
+
+```nix
+aprof = "export AWS_PROFILE=(aws configure list-profiles | fzf)";
+kprof = "kubectl config use-context (kubectl config get-contexts -o name | fzf)";
+```
+
+`aprof` fuzzy-picks an AWS profile; `kprof` fuzzy-switches kube context. No more copy-pasting
+profile names. There's also a `cht` function that queries [cheat.sh](https://cht.sh/) through fzf
+for quick command references.
+
+### The Hyprland desktop stack
+
+The graphical environment is a collection of small Wayland-native pieces, each doing one job. This
+is the opposite of a monolithic desktop environment like GNOME or KDE — every component is chosen
+and configured independently:
+
+| Tool | Replaces | Role |
+| --- | --- | --- |
+| [Hyprland](https://hyprland.org/) | GNOME/KDE/i3/sway | The tiling Wayland compositor itself |
+| [Waybar](https://github.com/Alexays/Waybar) | — | The status bar (workspaces, CPU, memory, battery, network, clock) |
+| [Tofi](https://github.com/philj56/tofi) | dmenu / rofi | The application launcher |
+| [Mako](https://github.com/emersion/mako) | dunst | Notification daemon |
+| [Hyprlock](https://github.com/hyprwm/hyprlock) | — | Screen locker |
+| [Hyprpaper](https://github.com/hyprwm/hyprpaper) | — | Wallpaper daemon |
+| [hyprshot](https://github.com/Gustash/hyprshot) | — | Screenshots (bound to `PRINT`) |
+| `wl-clipboard` | xclip | Wayland clipboard access |
+| `brightnessctl` | — | Backlight control (laptop) |
+
+Hyprland itself is configured Vim-style: `SUPER+H/J/K/L` to focus windows, with Ctrl to swap and
+Alt to resize, `SUPER+SPACE` for the Tofi launcher, `SUPER+T` for a terminal. Caps Lock is remapped
+to Escape (a habit that follows me to every machine, including the Mac). One detail I like: the
+Hyprland config is generated from Nix as *Lua*, which lets me use helper functions and loops — for
+instance, the ten workspace keybindings are generated with `lib.range 1 10` instead of being
+typed out by hand.
+
+### Browser, PDF, and the rest
+
+[Firefox](https://www.mozilla.org/firefox/) is the browser. [Zathura](https://pwmt.org/projects/zathura/)
+is the PDF viewer — keyboard-driven and minimal, replacing something heavy like Evince. GTK
+theming is wired through home-manager so even GTK apps pick up the Catppuccin look.
+
+### AI tooling
+
+Two LLM tools live in the terminal: [`aichat`](https://github.com/sigoden/aichat) for quick
+terminal LLM chat, and [`claude-code`](https://www.anthropic.com/claude-code) — Anthropic's coding
+CLI — pulled from that dedicated flake overlay so it stays current. (This post, in fact, was
+drafted with Claude Code reading the actual config files.)
+
+### Fun and misc
+
+Not everything earns its keep on utility. `asciinema` records terminal sessions (genuinely
+useful). `asciiquarium` puts a fish tank in the terminal and `cbonsai` grows a little ASCII bonsai
+— pure eye candy, and worth it.
+
+### Gaming: Steam
+
+Steam is enabled at the system level (`programs.steam.enable = true`). The 32-bit graphics and ALSA
+support enabled earlier exist largely so Steam and Proton can run Windows games. It's one line in
+the config; NixOS handles the rest.
+
+## Theming: one palette, everywhere
+
+A thread running through all of this is [Catppuccin](https://catppuccin.com/) — specifically the
+Mocha flavor with a mauve accent. The `catppuccin` flake provides modules that theme the TTY,
+GTK, the cursor, Helix, and more, so the look is consistent from the boot console to the desktop.
+
+The part I find genuinely elegant is that the palette is a **single source of truth**. Instead of
+copy-pasting hex codes into a dozen config files, modules import the palette JSON and reference
+colors by *name*. From the Fish config:
+
+```nix
+palette = (lib.importJSON
+  "${config.catppuccin.sources.palette}/palette.json").${config.catppuccin.flavor}.colors;
+fishColor = color: lib.removePrefix "#" "${palette.${color}.hex}";
+```
+
+Now the Tide prompt's git color is `${fishColor "green"}`, not `#a6e3a1`. If I ever switch flavors,
+every color across every app moves together. Waybar does the same thing to color its module icons.
+This is the kind of consistency that's tedious to maintain by hand and trivial when your config is
+a programming language.
+
+## The work Mac: same flake, different OS
+
+The third machine is a work MacBook, and it's managed by the *same repository* via nix-darwin.
+This is where the system/user split earns its keep: the system layer is completely different (it's
+macOS, not NixOS), but the **home-manager modules are largely shared**.
+
+The Darwin host config (`modules/nix-darwin/hosts/workLaptop.nix`) handles the macOS-specific
+system bits — and notably, it even reuses some of the NixOS common modules:
+
+```nix
+imports = [
+  ../../nixos/common/environment.nix
+  ../../nixos/common/fonts.nix
+  ../../nixos/common/nix.nix
+  ../../nixos/common/programs.nix
+];
+```
+
+The same Nix settings, the same fonts, the same shell setup as the Linux machines. On top of that
+it declares macOS system defaults (Caps Lock → Escape again, a left-side auto-hiding dock, fast
+key repeat) and — pragmatically — uses Homebrew for the GUI apps that only ship as Mac casks:
+
+```nix
+homebrew = {
+  enable = true;
+  casks = [ "nikitabobko/tap/aerospace" "doll" "raycast" "stats" ];
+  onActivation = { autoUpdate = true; cleanup = "uninstall"; upgrade = true; };
+};
+```
+
+[AeroSpace](https://github.com/nikitabobko/AeroSpace) is the tiling window manager — the closest
+thing macOS has to Hyprland — configured from a checked-in `aerospace.toml`. [Raycast](https://www.raycast.com/)
+is the launcher, Stats is a menu-bar monitor.
+
+The user side imports the same `common`, `shell`, `tui`, and `vc` modules as my personal machines,
+so my shell, Helix, git workflow, and Kitty config are *identical* across Linux and macOS. It
+diverges only where work demands it: a few extra packages (`sops` for secrets, `glab` for GitLab,
+`aws-nuke`), Mac-specific Kitty settings, and work-specific Fish functions for AWS SSO login and
+decoding JWTs:
+
+```nix
+awsso = "AWS_PROFILE=(aws configure list-profiles | grep sso | fzf) aws sso login; aprof";
+decode-jwt = "echo $argv | jq -R 'split(\".\") | .[1] | @base64d | fromjson'";
+```
+
+The point is work/personal separation *without forking the config*. The muscle memory I build at
+home works at work, because it's literally the same modules.
+
+## Living with it day to day
+
+Two commands cover almost everything. After editing the config:
+
+```sh
+nos    # nh os switch --ask --hostname <host> .         (system)
+nhs    # nh home switch --ask --configuration cyberdan@<host> .   (user)
+```
+
+Both go through `nh` with `--ask`, so I see a preview of what changes before anything activates. To
+pull in newer package versions, `nix flake update` bumps the pinned inputs, I commit the resulting
+`flake.lock`, and rebuild. If an update misbehaves, the previous generation is right there in the
+boot menu — or one `nixos-rebuild switch --rollback` away — and I'm back to a known-good system in
+seconds. Old generations age out automatically after 30 days.
+
+## What this actually buys me
+
+After running this setup across three machines, the concrete wins:
+
+- **A new machine is minutes, not a weekend.** Install NixOS, clone the repo, copy the hardware
+  config, run two commands, reboot. The machine comes up *exactly* like my others.
+- **Fearless experimentation.** I'll try a window manager tweak or a kernel parameter knowing that
+  the worst case is a one-line revert and a rebuild. There's no "I changed something three weeks
+  ago and now I can't undo it."
+- **The config *is* the documentation.** When someone asks how I have something set up, I link the
+  file. There's no gap between what I think my machine does and what it actually does.
+
+It's not for everyone — the learning curve is real, and if you just want a computer that works,
+Arch or Ubuntu will get you there with far less Nix-wrangling. But if you've ever wanted your
+entire machine to be as version-controlled, reviewable, and reproducible as your code, NixOS
+delivers that better than anything else I've used.
+
+> ### ❄️ Go read the config
+>
+> The whole thing is at
+> **[github.com/dannylongeuay/nixos-config](https://github.com/dannylongeuay/nixos-config)**. The
+> README has a full package table and a cheatsheet. Clone it, lift the modules you like, and
+> ignore the rest — that's exactly what it's there for.
